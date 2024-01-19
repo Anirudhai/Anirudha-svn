@@ -1,0 +1,318 @@
+name: 'auttest_basic_test_pipeline'
+trigger: none
+pool: "ARM-Qemu-c4cicd"
+resources:
+  pipelines:
+  - pipeline: triggering_pipeline_mpc
+    source: mpc_nightlybuild
+    trigger: true 
+  - pipeline: triggering_pipeline_v111
+    source: v111_nightlybuild            
+    trigger: true    
+parameters:
+ 
+ - name: 'number_of_iteration'
+   type: string
+   displayName: 'Number of iteration'
+   default: "1"
+   values: 
+    - "1"
+    - "2"
+    - "5"
+    - "10"
+    - "20"
+  
+variables:
+  - ${{ each param in parameters }}:
+    - name: ${{ param.Key }}
+      value: ${{ param.Value }}
+  - name: metadata_file
+    value: $(Build.Repository.LocalPath)/metadata.json
+  - group: auttest
+  - name: ui_test_tag
+    value: "@landing_page_test"
+stages:
+    - template: templates/loop.yml
+      parameters:
+        number_of_iterations: ${{parameters.number_of_iteration}}
+        jobtest:
+          job: 'basic_test_suite'
+          
+          continueOnError: True
+          timeoutInMinutes: 900
+          workspace:
+            clean: all
+          steps:
+            - template: mappings.yml
+              parameters:
+                controller_ip: ${{ parameters.controller_address }}
+                sw_package_name: ${{ variables['sw-package_name']}}
+                dev_sw_package: ${{parameters['sw-package_dev']}}
+            - ${{ if contains(lower(parameters.controller_address), 'dynamic') }}:
+              - script: | 
+                  echo "{\"all_ips\": $all_ips}"      
+                  http_response=$(curl  -w "%{http_code}" -o $(Build.ArtifactStagingDirectory)/$BUILD_BUILDNUMBER_reservation.json -X POST -u auttest:$(UI_PASSWORD) -H "Content-Type: application/json" --data "{\"all_ips\": $all_ips, \"ip_quantity\": 1}" http://$(AUTTEST_ADDRESS)/api/v1/dynamicreserve)
+                  if [ "$http_response" = "200" ]; then
+                    echo "Reservation request suceeded with HTTP response code $http_response"
+                    echo "Response body: $(cat $(Build.ArtifactStagingDirectory)/$BUILD_BUILDNUMBER_reservation.json)"
+                    reservation_id=$(jq -r '.reservation_id' $(Build.ArtifactStagingDirectory)/$BUILD_BUILDNUMBER_reservation.json)
+                    echo "Reservation ID: $reservation_id"
+                    reserved_ip=$(jq -r '.reserved_ips[0]' $(Build.ArtifactStagingDirectory)/$BUILD_BUILDNUMBER_reservation.json)
+                    echo "Reserved IP: $reserved_ip"
+                    echo "##vso[task.setvariable variable=reservation_id]$reservation_id"
+                    echo "##vso[task.setvariable variable=controller_address]$reserved_ip"
+                    [ -f $(Build.ArtifactStagingDirectory)/$BUILD_BUILDNUMBER_reservation.json ] && rm $(Build.ArtifactStagingDirectory)/$BUILD_BUILDNUMBER_reservation.json
+                  else
+                    echo "Reservation request failed with HTTP response code $http_response"
+                    echo "Response body: $(cat $(Build.ArtifactStagingDirectory)/$BUILD_BUILDNUMBER_reservation.json)"
+                    [ -f $(Build.ArtifactStagingDirectory)/$BUILD_BUILDNUMBER_reservation.json ] && rm $(Build.ArtifactStagingDirectory)/$BUILD_BUILDNUMBER_reservation.json
+                    exit 1
+                  fi
+                env:  
+                  all_ips: $(all_ips)
+               
+                # we need to launch mapping once again with reserved IP
+              - bash: |
+                  echo "Controller address: $controller_address"
+                  controller_address_no_dots="${controller_address//.}"                  
+                  config_serial_var_name="${controller_address_no_dots}_CONFIG_SERIAL"
+                  device_id_var_name="${controller_address_no_dots}_DEVICE_ID"
+                  config_serial=$(env | grep $config_serial_var_name | cut -f2 -d=)
+                  device_id=$(env | grep $device_id_var_name | cut -f2 -d=)
+                 
+                  echo "Config serial var name: ${config_serial_var_name}"
+                  echo "Device ID var name: ${device_id_var_name}"
+                  echo "Registering config_serial: $config_serial and device_id: $device_id for dynamic controller IP: $(controller_address)"                  
+                  echo "##vso[task.setvariable variable=config_serial]$config_serial"
+                  echo "##vso[task.setvariable variable=device_id]$device_id"
+                env:                  
+                  controller_address: $(controller_address)
+                displayName: 'Registering runtime variables for dynamic controller IP'
+            - ${{else}}:
+              - template: controller_reservation.yml
+                parameters:
+                  reservation_data: 
+                    requested_ips: '["$(controller_address)"]'
+                    all_ips: $(all_ips)
+
+            - ${{ if eq(variables['build.reason'], 'ResourceTrigger') }}: 
+              - script: |
+                  pipeline_alias=$RESOURCES_TRIGGERINGALIAS
+                  echo "Triggering pipeline alias": $pipeline_alias
+                  triggering_pipeline_project_id_var_name="RESOURCES_PIPELINE_""${pipeline_alias^^}""_PROJECTID"
+                 
+                  echo "Setting triggering pipeline from env: $triggering_pipeline_run_id_var_name with value: ${!triggering_pipeline_run_id_var_name}"
+                  echo "##vso[task.setvariable variable=triggering_pipeline_run_id;]${!triggering_pipeline_run_id_var_name}"
+                displayName: Setting variables for fetching build timestamp artifact
+      
+              - task: DownloadBuildArtifacts@0
+                inputs:
+                  buildType: 'specific'
+                  project: $(triggering_pipeline_project_id)
+                  pipeline:  $(triggering_pipeline_pipeline_id)
+                  buildVersionToDownload: 'specific'
+                  buildId: $(triggering_pipeline_run_id)
+                  downloadType: 'single'
+                  downloadPath: '$(System.ArtifactsDirectory)'
+                  artifactName: 'build_timestamp'
+      
+                
+              - bash: |
+                  stages="deploy_dt ui_test e2e_test mini_ui_test"
+                  for stage in $stages
+                  do
+                    echo "Setting $stage to: True"
+                    echo "##vso[task.setvariable variable=$stage;]True"  
+                  done
+
+                  pipeline_alias=$RESOURCES_TRIGGERINGALIAS
+                  echo "Triggering pipeline alias": $pipeline_alias
+                  triggering_pipeline_var_name="RESOURCES_PIPELINE_""${pipeline_alias^^}""_PIPELINENAME"
+                  echo "Setting triggering pipeline from env: $triggering_pipeline_var_name with value: ${!triggering_pipeline_var_name}"
+                  echo "##vso[task.setvariable variable=triggering_pipeline_name;]${!triggering_pipeline_var_name}"
+
+                  
+                  commit=$(cat $(Build.ArtifactStagingDirectory)/build_timestamp/build_timestamp.txt)
+                
+                  echo "Setting updater_version to: $commit"
+                  echo "##vso[task.setvariable variable=updater_version;]$commit"
+
+                  echo "Setting UI test tag depending on the day of week"
+                  day_of_week=$(date +%u)
+                  weekday_tag="ui_exampleORui_helperORauttest_webUI"
+                  weekend_tag="ui_exampleORui_helperORauttest_webUIORweekend_auttest_webUI"
+                  # check for weekend vs weekday
+                  if [ $day_of_week -gt 5 ]; then
+                    echo "It's weekend, setting UI test tag to: $weekend_tag"
+                    echo "##vso[task.setvariable variable=ui_test_tag;]$weekend_tag"
+                  else
+                    echo "It's weekday, setting UI test tag to: $weekday_tag"
+                    echo "##vso[task.setvariable variable=ui_test_tag;]$weekday_tag"
+                  fi
+
+              - bash: |
+                    v111_settings="sw-package_name:v111 config_model:GHS585VSD+ config_features:HLP_mqtt-tool config_type:v111 test_tag:V142_Data_Driven updater_features:HLP_mqtt-tool,HWHCAP,PUMPDOPT"
+                    for setting in $v111_settings
+                    do 
+                    
+                      echo "##vso[task.setvariable variable=${setting%%:*};]${setting##*:}"  
+                    done
+                
+                condition: contains(variables['triggering_pipeline_name'] , 'v111')
+            
+            - bash: |
+                printenv | sort
+              
+  
+            - ${{ if eq(variables['deploy_dt'], 'True') }}:
+              - template: metadata.yml
+                parameters:
+                  metadata_file: $(metadata_file)
+                  metadata:
+                    controller_ip: $(CONTROLLER_ADDRESS)
+                    config_brand: $(config_brand)                   
+                    config_feature: $(CONFIG_FEATURES)
+                    config_model: $(CONFIG_MODEL)
+                    sw_package_name: $(SW-PACKAGE_NAME)
+                    sw_package_version: $(SW-PACKAGE_VERSION)                          
+                    ${{ if eq(variables['build.reason'], 'ResourceTrigger') }}:
+                      triggered_by_nightly_build: true
+                    ${{else}}:
+                      triggered_by_nightly_build: false
+                  build_id: $(Build.BuildId)
+
+              - template: delete_genius_entry.yml
+                parameters: 
+                  controller_address: $(CONTROLLER_ADDRESS)
+              - bash: |
+                  echo "##[command]Removing temporary directories" &&
+                  (([[ -d $AGENT_TEMPDIRECTORY/$BUILD_BUILDID ]] &&  sudo rm -rf $AGENT_TEMPDIRECTORY/$BUILD_BUILDID) || :)
+                
+              - task: PythonScript@0
+                inputs:
+                  scriptSource: filePath
+                  scriptPath: $(Build.Repository.LocalPath)/scripts/deployToController.py
+                  pythonInterpreter: /usr/bin/python3
+                  arguments: >-
+                    -c $(CONTROLLER_ADDRESS) -j $(JUMPHOST) -t $(AUTTEST_ADDRESS) -p $(UI_PASSWORD) -r $(reservation_id) $(production_controller_switch) dt 
+                    $(SW_PACKAGE_SWITCH) 
+                    --sw-package-name $(SW-PACKAGE_NAME)  
+                    --sw-package-version  $(SW-PACKAGE_VERSION)  
+                    --sw-package-sas $(SAS_SW_PACKAGE) 
+                    --config-serial $(CONFIG_SERIAL) 
+                    --config-brand $(CONFIG_BRAND) 
+                    --config-model $(CONFIG_MODEL)
+                    --config-type $(CONFIG_TYPE) 
+                    --config-features $(CONFIG_FEATURES)
+              
+              - template: landing_page_check.yml
+                parameters:
+                  controller_address: $(CONTROLLER_ADDRESS)
+              
+
+            - ${{ if eq(variables['ui_test'], 'True') }}:
+              - template: metadata.yml
+                parameters:
+                  metadata_file: $(metadata_file)
+                  metadata:
+                    controller_ip: $(CONTROLLER_ADDRESS)
+                    config_brand: $(config_brand)                   
+                    config_feature: $(CONFIG_FEATURES)
+                    config_model: $(CONFIG_MODEL)
+                    sw_package_name: $(SW-PACKAGE_NAME)
+                    sw_package_version: $(SW-PACKAGE_VERSION)                          
+                    ${{ if eq(variables['build.reason'], 'ResourceTrigger') }}:
+                      triggered_by_nightly_build: true
+                    ${{else}}:
+                      triggered_by_nightly_build: false
+                  build_id: $(Build.BuildId)
+             
+              - template: allure_report.yml
+                parameters:
+                  test_description: "#### Test reports for UI test"
+              
+            - ${{ if eq(variables['e2e_test'], 'True') }}:
+              - template: metadata.yml
+                parameters:
+                  metadata_file: $(metadata_file)
+                  metadata:
+                    controller_ip: $(CONTROLLER_ADDRESS)
+                    config_brand: $(config_brand)
+                    config_feature: $(CONFIG_FEATURES)
+                    config_model: $(CONFIG_MODEL)
+                    sw_package_name: $(SW-PACKAGE_NAME)
+                    sw_package_version: $(SW-PACKAGE_VERSION) 
+                    ${{ if eq(variables['build.reason'], 'ResourceTrigger') }}:
+                      triggered_by_nightly_build: true
+                    ${{else}}:
+                      triggered_by_nightly_build: false
+                  build_id: $(Build.BuildId)
+              
+              - task: PythonScript@0
+                inputs:
+                  scriptSource: filePath
+                  scriptPath: $(Build.Repository.LocalPath)/scripts/performTests.py
+                  pythonInterpreter: /usr/bin/python3
+                  arguments: >-
+                    -c $(CONTROLLER_ADDRESS) -j $(JUMPHOST) -t $(AUTTEST_ADDRESS) -p $(UI_PASSWORD) -r $(reservation_id) $(production_controller_switch)
+                    --repo-url $(repo_url)
+                    --repo-pat $(UI_REPO_PAT)
+                    --repo-branch $(repo_branch)
+                    --test-ids $(TEST_TAG)
+                    --sw-package-sas $(SAS_SW_PACKAGE)                        
+                    --test-result-sas $(UI_SAS_RESULTS)
+                    --test-result-read-sas $(UI_SAS_RESULTS_READ)
+                    --updater-tar-version $(updater_version)
+                    --updater-license  $(license_token)
+                    --genious-user $(UI_GENIOUS_CLOUD_USERNAME)
+                    --genious-password $(UI_GENIOUS_CLOUD_PASSWORD)
+                    --updater-features $(updater_features)
+                    --updater-sw-package-name $(sw-package_name)
+                    --config-serial $(config_serial)
+                    --config-brand  $(config_brand)
+                    --config-model $(config_model)
+                    --config-features $(config_features)
+                    --device-id $(device_id)
+                    --metadata-json-file $(metadata_file)
+            
+                
+              - template: landing_page_check.yml
+                parameters:
+                  controller_address: $(CONTROLLER_ADDRESS)
+              
+            - ${{ if eq(variables['mini_ui_test'], 'True') }}:
+              - task: PythonScript@0
+                inputs:
+                  scriptSource: filePath
+                  scriptPath: $(Build.Repository.LocalPath)/scripts/deployToController.py
+                  pythonInterpreter: /usr/bin/python3
+                  arguments: >-
+                    -c $(CONTROLLER_ADDRESS) -j $(JUMPHOST) -t $(AUTTEST_ADDRESS) -p $(UI_PASSWORD) -r $(reservation_id) $(production_controller_switch) miniui
+                    --version  $(MINIUI_VERSION)
+                displayName: Miniui deployment for version $(MINI_UI_VERSION)
+                
+         
+              - template: metadata.yml
+                parameters:
+                  metadata_file: $(metadata_file)
+                  metadata:
+                    controller_ip: $(CONTROLLER_ADDRESS)
+                    config_brand: $(config_brand)
+                    config_feature: $(CONFIG_FEATURES)
+                    config_model: $(CONFIG_MODEL)
+                    sw_package_name: $(SW-PACKAGE_NAME)
+                    sw_package_version: $(SW-PACKAGE_VERSION)
+                    ${{ if eq(variables['build.reason'], 'ResourceTrigger') }}:
+                      triggered_by_nightly_build: true
+                    ${{else}}:
+                      triggered_by_nightly_build: false
+
+                  build_id: $(Build.BuildId)
+             
+                
+              - template: ssh_reboot.yml
+                parameters:
+                  controller_address: $(CONTROLLER_ADDRESS)
+             
+                      
+           

@@ -1,0 +1,33 @@
+pipeline
+{
+    agent any
+    
+    stages
+    {  
+        stage ('Build')
+        {
+            steps
+            {
+              echo 'Hello Im Anirudha Ingole in Devops practice'
+            }
+        }    
+         stage ('Testing')
+    {
+         steps
+         {
+            echo 'The given information is correctly specifide'
+         }
+         
+        }
+        stage ('Deploy')
+        {
+            steps
+            {
+                echo 'Deploy this information to the test server'
+            }
+            
+        }
+            }
+        }
+
+
